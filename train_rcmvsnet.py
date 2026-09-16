@@ -79,6 +79,17 @@ parser.add_argument('--lambda_edge', type=float, default=4.0,
 parser.add_argument('--lambda_img', type=float, default=1.0,
                     help='release strength of the image gradient (baseline value 1.0)')
 
+# --- Low-memory step for 12 GB GPUs (see RUN_EXPERIMENTS.md, Step 3.2) --------
+# The published loop keeps three autograd graphs alive at once (S1 backbone,
+# S2 augmented backbone, S3 rendering net) and backpropagates their summed loss
+# at the end. --low_mem runs S3 right after S1 and backpropagates S1+S3, then
+# runs S2 and backpropagates it, and steps the optimizer once. No parameter
+# changes between the forwards, so the accumulated gradient is the same sum;
+# only the order of random draws (ray sampling, augmentation mask) differs.
+# Use the same setting for every run you compare.
+parser.add_argument('--low_mem', action='store_true',
+                    help='backprop S1+S3 before running S2 so the three graphs never coexist')
+
 
 parser.add_argument('--true_gpu',default="0",help='using true gpu')
 parser.add_argument('--gpu',default=[0],help='gpu')
@@ -180,41 +191,76 @@ def train(model, model_nerf,model_loss, aug_loss, test_model_loss, optimizer, Tr
                 avg_train_scalars.update(scalar_outputs)
                 del scalar_outputs, image_outputs
 
-            # stage 2: augmentation self-supervision loss update
-            loss_t, aug_scalar_outputs, aug_image_outputs,loss_aug = train_sample_aug(model, aug_loss, optimizer, sample, args, pseudo_depth, epoch_idx)
-            if (not is_distributed) or (dist.get_rank() == 0):
-                if do_summary:
-                    save_scalars(logger, 'train', aug_scalar_outputs, global_step)
-                    save_images(logger, 'train', aug_image_outputs, global_step)
-                    print(
-                       "Epoch {}/{}, Iter-S2 {}/{}, lr {:.6f}, aug loss = {:.3f}, depth loss = {:.3f}, thres2mm_error = {:.3f}, thres2mm_accu = {:.3f}, thres4mm_error = {:.3f}, thres4mm_accu = {:.3f}, thres8mm_error = {:.3f}, thres8mm_accu = {:.3f}, time = {:.3f}".format(
-                           epoch_idx, args.epochs, batch_idx, len(TrainImgLoader),
-                           optimizer.param_groups[0]["lr"], loss_t,
-                           aug_scalar_outputs['aug_loss_stage3'],
-                           aug_scalar_outputs['thres2mm_error'],aug_scalar_outputs['thres2mm_accu'],
-                           aug_scalar_outputs['thres4mm_error'],aug_scalar_outputs['thres4mm_accu'],
-                           aug_scalar_outputs['thres8mm_error'],aug_scalar_outputs['thres8mm_accu'],
-                           time.time() - start_time))
-                avg_aug_scalars.update(aug_scalar_outputs)
-                del aug_scalar_outputs, aug_image_outputs
+            if not args.low_mem:
+                # stage 2: augmentation self-supervision loss update
+                loss_t, aug_scalar_outputs, aug_image_outputs,loss_aug = train_sample_aug(model, aug_loss, optimizer, sample, args, pseudo_depth, epoch_idx)
+                if (not is_distributed) or (dist.get_rank() == 0):
+                    if do_summary:
+                        save_scalars(logger, 'train', aug_scalar_outputs, global_step)
+                        save_images(logger, 'train', aug_image_outputs, global_step)
+                        print(
+                           "Epoch {}/{}, Iter-S2 {}/{}, lr {:.6f}, aug loss = {:.3f}, depth loss = {:.3f}, thres2mm_error = {:.3f}, thres2mm_accu = {:.3f}, thres4mm_error = {:.3f}, thres4mm_accu = {:.3f}, thres8mm_error = {:.3f}, thres8mm_accu = {:.3f}, time = {:.3f}".format(
+                               epoch_idx, args.epochs, batch_idx, len(TrainImgLoader),
+                               optimizer.param_groups[0]["lr"], loss_t,
+                               aug_scalar_outputs['aug_loss_stage3'],
+                               aug_scalar_outputs['thres2mm_error'],aug_scalar_outputs['thres2mm_accu'],
+                               aug_scalar_outputs['thres4mm_error'],aug_scalar_outputs['thres4mm_accu'],
+                               aug_scalar_outputs['thres8mm_error'],aug_scalar_outputs['thres8mm_accu'],
+                               time.time() - start_time))
+                    avg_aug_scalars.update(aug_scalar_outputs)
+                    del aug_scalar_outputs, aug_image_outputs
 
+                # stage 3: rendering consistency; backprops S1+S2+S3 and steps
+                loss_nerf, nerf_scalar_outputs, nerf_image_outputs = train_render_net(volume_feature,model_nerf,sample,optimizer,pseudo_depth,epoch_idx,args,loss_base,loss_aug)
+                if (not is_distributed) or (dist.get_rank() == 0):
+                    if do_summary:
+                        save_scalars(logger, 'train', nerf_scalar_outputs, global_step)
+                        save_images(logger, 'train', nerf_image_outputs, global_step)
+                        print(
+                           "Epoch {}/{}, Iter-S2 {}/{}, lr {:.6f}, overall loss = {:.9f}, img loss = {:.9f},depth loss = {:.9f}, time = {:.3f}".format(
+                               epoch_idx, args.epochs, batch_idx, len(TrainImgLoader),
+                               optimizer.param_groups[0]["lr"], loss_nerf,
+                               nerf_scalar_outputs['img_loss'], nerf_scalar_outputs['depth_loss'],
+                               time.time() - start_time))
+                    avg_nerf_scalars.update(nerf_scalar_outputs)
+                    del nerf_scalar_outputs, nerf_image_outputs
+            else:
+                # --low_mem: stage 3 first and backprop S1+S3 now (frees both graphs),
+                # then stage 2 on its own; gradients accumulate, one optimizer step.
+                loss_nerf, nerf_scalar_outputs, nerf_image_outputs = train_render_net(volume_feature,model_nerf,sample,optimizer,pseudo_depth,epoch_idx,args,loss_base,0.0,do_step=False)
+                if (not is_distributed) or (dist.get_rank() == 0):
+                    if do_summary:
+                        save_scalars(logger, 'train', nerf_scalar_outputs, global_step)
+                        save_images(logger, 'train', nerf_image_outputs, global_step)
+                        print(
+                           "Epoch {}/{}, Iter-S2 {}/{}, lr {:.6f}, overall loss = {:.9f}, img loss = {:.9f},depth loss = {:.9f}, time = {:.3f}".format(
+                               epoch_idx, args.epochs, batch_idx, len(TrainImgLoader),
+                               optimizer.param_groups[0]["lr"], loss_nerf,
+                               nerf_scalar_outputs['img_loss'], nerf_scalar_outputs['depth_loss'],
+                               time.time() - start_time))
+                    avg_nerf_scalars.update(nerf_scalar_outputs)
+                    del nerf_scalar_outputs, nerf_image_outputs
+                del volume_feature, loss_base
 
-
-
-           
-            loss_nerf, nerf_scalar_outputs, nerf_image_outputs = train_render_net(volume_feature,model_nerf,sample,optimizer,pseudo_depth,epoch_idx,args,loss_base,loss_aug)
-            if (not is_distributed) or (dist.get_rank() == 0):
-                if do_summary:
-                    save_scalars(logger, 'train', nerf_scalar_outputs, global_step)
-                    save_images(logger, 'train', nerf_image_outputs, global_step)
-                    print(
-                       "Epoch {}/{}, Iter-S2 {}/{}, lr {:.6f}, overall loss = {:.9f}, img loss = {:.9f},depth loss = {:.9f}, time = {:.3f}".format(
-                           epoch_idx, args.epochs, batch_idx, len(TrainImgLoader),
-                           optimizer.param_groups[0]["lr"], loss_nerf,
-                           nerf_scalar_outputs['img_loss'], nerf_scalar_outputs['depth_loss'],
-                           time.time() - start_time))
-                avg_nerf_scalars.update(nerf_scalar_outputs)
-                del nerf_scalar_outputs, nerf_image_outputs
+                loss_t, aug_scalar_outputs, aug_image_outputs,loss_aug = train_sample_aug(model, aug_loss, optimizer, sample, args, pseudo_depth, epoch_idx)
+                if (not is_distributed) or (dist.get_rank() == 0):
+                    if do_summary:
+                        save_scalars(logger, 'train', aug_scalar_outputs, global_step)
+                        save_images(logger, 'train', aug_image_outputs, global_step)
+                        print(
+                           "Epoch {}/{}, Iter-S2 {}/{}, lr {:.6f}, aug loss = {:.3f}, depth loss = {:.3f}, thres2mm_error = {:.3f}, thres2mm_accu = {:.3f}, thres4mm_error = {:.3f}, thres4mm_accu = {:.3f}, thres8mm_error = {:.3f}, thres8mm_accu = {:.3f}, time = {:.3f}".format(
+                               epoch_idx, args.epochs, batch_idx, len(TrainImgLoader),
+                               optimizer.param_groups[0]["lr"], loss_t,
+                               aug_scalar_outputs['aug_loss_stage3'],
+                               aug_scalar_outputs['thres2mm_error'],aug_scalar_outputs['thres2mm_accu'],
+                               aug_scalar_outputs['thres4mm_error'],aug_scalar_outputs['thres4mm_accu'],
+                               aug_scalar_outputs['thres8mm_error'],aug_scalar_outputs['thres8mm_accu'],
+                               time.time() - start_time))
+                    avg_aug_scalars.update(aug_scalar_outputs)
+                    del aug_scalar_outputs, aug_image_outputs
+                loss_aug.backward()
+                optimizer.step()
+                del loss_aug
 
 
             lr_scheduler.step()
@@ -292,7 +338,7 @@ def test(model, model_loss, TestImgLoader, args):
 
 
     
-def train_render_net(volume_feature,model_nerf,sample,optimizer,pseudo_depth,epoch_idx,args,loss_base,loss_aug):
+def train_render_net(volume_feature,model_nerf,sample,optimizer,pseudo_depth,epoch_idx,args,loss_base,loss_aug,do_step=True):
     model_nerf.train()
     # optimizer.zero_grad()
     
@@ -325,7 +371,8 @@ def train_render_net(volume_feature,model_nerf,sample,optimizer,pseudo_depth,epo
 
 
     loss.backward()
-    optimizer.step()
+    if do_step:
+        optimizer.step()
     image_outputs = {"nerf_depth_est": pseudo_depth * mask_dtu,
                      "nerf_depth_est_nomask": pseudo_depth
                          }

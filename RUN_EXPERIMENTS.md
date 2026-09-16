@@ -8,9 +8,12 @@ is the *how*.
 
 ### 0.1 Paths used below
 
-Set these in every new terminal (or put them in `~/RC-MVSNet/paths.sh` and `source` it):
+Every command below uses these variables (`$DTU`, `$RUNS`, ...). A variable
+set with `export` only lives in the terminal where you typed it, so a new
+terminal starts without them. The easy way is to save them once in a file:
 
 ```bash
+cat > ~/RC-MVSNet/paths.sh <<'EOF'
 export REPO=~/RC-MVSNet
 export DTU=$REPO/dtu                  # Cameras, Depths, Depths_raw, Rectified
 export DTU_TEST=$REPO/dtu_test        # scan1/{cams,images,pair.txt}, ...   <- adjust
@@ -18,7 +21,19 @@ export DTU_GT=$REPO/dtu_gt            # Points/stl/*.ply, ObsMask/*.mat     <- a
 export PRIORS=$REPO/dtu_edge_priors
 export RUNS=$REPO/runs
 cd $REPO
+EOF
 ```
+
+Then, at the start of every new terminal, load it with:
+
+```bash
+source ~/RC-MVSNet/paths.sh
+echo $DTU                              # should print /home/.../RC-MVSNet/dtu
+```
+
+`source` runs the file inside your current terminal, so the variables stay set
+there. Running it as `bash paths.sh` or `./paths.sh` would not work: that starts
+a separate shell, sets the variables there, and they vanish when it exits.
 
 Keep the data out of git:
 
@@ -71,6 +86,33 @@ ls $DTU_GT/ObsMask | head -3          # ObsMask1_10.mat  Plane1.mat ...
 `DTU_TEST` is the separate *DTU testing* download from the README. `DTU_GT` is the
 official DTU `SampleSet/MVS Data` folder with `Points.zip` extracted into it
 (it must contain the `Points/stl` clouds for all 22 test scans, not only scan1/6).
+
+**`ObsMask` is required for Step 6.** It holds, per scan, the observation mask
+(`ObsMaskN_10.mat`: which part of space the structured-light scanner actually
+saw) and the ground plane (`PlaneN.mat`). The official accuracy drops fused
+points outside the mask, and completeness ignores GT points below the table
+plane. Without them, background and table points count as errors and your
+numbers are not comparable to any published DTU result.
+
+Get it from the DTU MVS page (roboimagedata.compute.dtu.dk → MVS Data set 2014):
+
+| download | provides |
+|---|---|
+| `SampleSet.zip` | `MVS Data/ObsMask/` for all scans, plus Points/Cleaned/Rectified for scan1 and scan6 only |
+| `Points.zip` | `Points/stl/stlNNN_total.ply` for all scans |
+
+Build `DTU_GT` from them:
+
+```bash
+mkdir -p $DTU_GT
+unzip SampleSet.zip 'SampleSet/MVS Data/ObsMask/*' -d /tmp/dtu_sample
+mv "/tmp/dtu_sample/SampleSet/MVS Data/ObsMask" $DTU_GT/
+unzip Points.zip -d $DTU_GT            # must end up as $DTU_GT/Points/stl/...
+ls $DTU_GT/ObsMask | grep -c ObsMask   # expect one per scan (>= 22)
+```
+
+If you already extracted `SampleSet` for the preprocessing work, just copy its
+`MVS Data/ObsMask` folder instead of unzipping again.
 
 ### 0.5 Two gotchas in the training script
 
