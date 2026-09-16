@@ -10,7 +10,8 @@ from datasets.utils import *
 
 # the DTU dataset preprocessed by Yao Yao (only for training)
 class MVSDataset(Dataset):
-    def __init__(self, datapath, listfile, mode, nviews, ndepths=192, interval_scale=1.06,random_view=False,**kwargs):
+    def __init__(self, datapath, listfile, mode, nviews, ndepths=192, interval_scale=1.06,random_view=False,
+                 edge_prior_dir=None, **kwargs):
         super(MVSDataset, self).__init__()
         self.datapath = datapath
         self.listfile = listfile
@@ -20,6 +21,10 @@ class MVSDataset(Dataset):
         self.interval_scale = interval_scale
         self.kwargs = kwargs
         self.random_view = random_view
+        # Directory of precomputed geometric-edge priors produced by
+        # tools/precompute_dav2_priors.py. None -> baseline behaviour, the
+        # sample dict simply has no "edge_prior" key.
+        self.edge_prior_dir = edge_prior_dir
         # self.scale_factor = 1
         print("mvsdataset kwargs", self.kwargs)
 
@@ -210,6 +215,30 @@ class MVSDataset(Dataset):
         return np.array(read_pfm(filename)[0], dtype=np.float32)
 
 
+    def read_edge_prior(self, scan, vid):
+        """Geometric-edge probability for one view, at stage-3 resolution.
+
+        One map per (scan, view): it is shared across the 7 DTU lightings
+        because the geometry it describes does not change with illumination.
+        See tools/precompute_dav2_priors.py.
+
+        Returns float32 [1, 512, 640] in [0, 1]. Raises if the prior is missing.
+        """
+        path = os.path.join(self.edge_prior_dir, scan, 'edge_{:0>4}.png'.format(vid))
+        if not os.path.exists(path):
+            # Deliberately fatal. A run where some samples carry a prior and
+            # others silently fall back to the image-gradient baseline is not a
+            # clean ablation, so refuse rather than quietly mix the two.
+            raise FileNotFoundError(
+                'edge prior not found: {}\nRun tools/precompute_dav2_priors.py for '
+                'this scan, or drop --edge_prior_dir to train the baseline.'.format(path))
+        e = np.array(Image.open(path), dtype=np.float32) / 255.
+        if e.ndim == 3:
+            e = e[..., 0]
+        if e.shape != (512, 640):
+            e = cv2.resize(e, (640, 512), interpolation=cv2.INTER_LINEAR)
+        return e[None].astype(np.float32)   # [1, H, W]
+
     def read_depth_hr(self, filename):
         # read pfm depth file
         # w1600-h1200-> 800-600 ; crop -> 640, 512; downsample 1/4 -> 160, 128
@@ -241,6 +270,7 @@ class MVSDataset(Dataset):
         center_imgs = []
         mask = None
         depth_values = None
+        edge_prior = None
         proj_matrices = []
 
         affine_mat, affine_mat_inv = [], []
@@ -307,6 +337,11 @@ class MVSDataset(Dataset):
 
                 mask = mask_read_ms
 
+                # The smoothness term is only evaluated on the reference view,
+                # so only the reference view needs a prior.
+                if self.edge_prior_dir is not None:
+                    edge_prior = self.read_edge_prior(scan, vid)
+
             # imgs.append(img)
             imgs.append(image_seg)
             imgs_aug.append(image_aug)
@@ -348,6 +383,8 @@ class MVSDataset(Dataset):
         sample["depth_values"] = depth_values
         sample["mask"] = mask
         sample["center_imgs"] = center_imgs
+        if edge_prior is not None:
+            sample["edge_prior"] = edge_prior   # [1, 512, 640] float32 in [0, 1]
 
         # nerf_render_data
         sample['depths_h'] = depths_h.astype(np.float32)  # (V, H, W)

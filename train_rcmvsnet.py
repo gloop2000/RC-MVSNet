@@ -63,6 +63,22 @@ parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regul
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
 parser.add_argument('--w_aug', type=float, default=0.01, help='weight of aug loss')
 
+# --- Depth-Anything-V2 geometric edge prior (see EDGE_PRIOR.md) --------------
+# Defaults reproduce the published RC-MVSNet exactly: edge_mode='image' and no
+# prior directory means the loss and the dataloader take their original paths.
+parser.add_argument('--edge_prior_dir', type=str, default=None,
+                    help='directory of precomputed edge priors from '
+                         'tools/precompute_dav2_priors.py; unset = baseline')
+parser.add_argument('--edge_mode', type=str, default='image',
+                    choices=['image', 'prior', 'product'],
+                    help="smoothness weighting: 'image' = published baseline, "
+                         "'prior' = DAv2 geometric edges, 'product' = image "
+                         "gradient gated by the prior")
+parser.add_argument('--lambda_edge', type=float, default=4.0,
+                    help='release strength of the edge prior (edge_mode=prior)')
+parser.add_argument('--lambda_img', type=float, default=1.0,
+                    help='release strength of the image gradient (baseline value 1.0)')
+
 
 parser.add_argument('--true_gpu',default="0",help='using true gpu')
 parser.add_argument('--gpu',default=[0],help='gpu')
@@ -342,8 +358,11 @@ def train_sample(model, model_loss, optimizer, sample, args):
     outputs,volume_feature = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["depth_values"])
     depth_est = outputs["depth"]
     
+    # edge_prior is absent from the sample dict unless --edge_prior_dir was set,
+    # in which case .get(...) returns None and the loss uses its baseline path.
     repr_loss, scalars = model_loss(outputs, sample_cuda["center_imgs"], sample_cuda["proj_matrices"],
-                               dlossw=[float(e) for e in args.dlossw.split(",") if e])
+                               dlossw=[float(e) for e in args.dlossw.split(",") if e],
+                               edge=sample_cuda.get("edge_prior", None))
 
     loss = repr_loss
 
@@ -525,7 +544,9 @@ def train_begin(rank,args):
     model_nerf = nn.SyncBatchNorm.convert_sync_batchnorm(model_nerf)
     print(model)
     print(model_nerf)
-    model_loss = UnsupLossMultiStage().to(rank)
+    model_loss = UnsupLossMultiStage(edge_mode=args.edge_mode,
+                                     lambda_edge=args.lambda_edge,
+                                     lambda_img=args.lambda_img).to(rank)
 
     aug_loss = AugLossMultiStage().to(rank)
     test_model_loss = cas_mvsnet_loss
@@ -585,7 +606,8 @@ def train_begin(rank,args):
     # dataset, dataloader
     MVSDataset = find_dataset_def(args.dataset)
     # train_dataset = MVSDataset(args.trainpath, args.trainlist, "train", 3, args.numdepth, args.interval_scale)
-    train_dataset = MVSDataset(args.trainpath, args.trainlist, "train", args.num_view+1, args.numdepth, args.interval_scale)
+    train_dataset = MVSDataset(args.trainpath, args.trainlist, "train", args.num_view+1, args.numdepth, args.interval_scale,
+                               edge_prior_dir=args.edge_prior_dir)
     test_MVSDataset = find_dataset_def('dtu_yao')
     test_dataset = test_MVSDataset(args.testpath, args.testlist, "test", 5, args.numdepth, args.interval_scale)
 

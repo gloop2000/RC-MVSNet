@@ -7,11 +7,19 @@ from losses.homography import *
 
 
 class UnSupLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, edge_mode='image', lambda_edge=4.0, lambda_img=1.0):
+        """
+        edge_mode: 'image' reproduces the published loss exactly. 'prior' and
+                   'product' use the precomputed geometric-edge prior; see
+                   losses/modules.py::depth_smoothness_prior.
+        """
         super(UnSupLoss, self).__init__()
         self.ssim = SSIM()
+        self.edge_mode = edge_mode
+        self.lambda_edge = lambda_edge
+        self.lambda_img = lambda_img
 
-    def forward(self, imgs, cams, depth, stage_idx):
+    def forward(self, imgs, cams, depth, stage_idx, edge=None):
         # print('imgs: {}'.format(imgs.shape))
         # print('cams: {}'.format(cams.shape))
         # print('depth: {}'.format(depth.shape))
@@ -30,6 +38,16 @@ class UnSupLoss(nn.Module):
             ref_img = F.interpolate(ref_img, scale_factor=0.5,recompute_scale_factor=True)
         else:
             pass
+
+        # Bring the edge prior to this stage's resolution. Resizing to ref_img's
+        # exact size (rather than by scale factor) guarantees the two line up
+        # even if recompute_scale_factor rounds differently.
+        ref_edge = None
+        if edge is not None and self.edge_mode != 'image':
+            ref_edge = F.interpolate(edge, size=(ref_img.shape[2], ref_img.shape[3]),
+                                     mode='bilinear', align_corners=False)
+            ref_edge = ref_edge.permute(0, 2, 3, 1)  # [B, 1, H, W] --> [B, H, W, 1]
+
         ref_img = ref_img.permute(0, 2, 3, 1)  # [B, C, H, W] --> [B, H, W, C]
         ref_cam = cams[0]
         # print('ref_cam: {}'.format(ref_cam.shape))
@@ -72,7 +90,13 @@ class UnSupLoss(nn.Module):
                 self.ssim_loss += torch.mean(self.ssim(ref_img, warped_img, mask))
 
         ##smooth loss##
-        self.smooth_loss += depth_smoothness(depth.unsqueeze(dim=-1), ref_img, 1.0)
+        # edge_mode == 'image' and ref_edge is None both fall through to the
+        # original image-gradient weighting, so the baseline is bit-identical.
+        self.smooth_loss += depth_smoothness_prior(depth.unsqueeze(dim=-1), ref_img,
+                                                   ref_edge,
+                                                   lambda_img=self.lambda_img,
+                                                   lambda_edge=self.lambda_edge,
+                                                   mode=self.edge_mode)
 
         # top-k operates along the last dimension, so swap the axes accordingly
         reprojection_volume = torch.stack(reprojection_losses).permute(1, 2, 3, 4, 0)
@@ -421,12 +445,16 @@ class UnsupLossMultiStage_07(nn.Module):
         return total_loss, scalar_outputs
 
 class UnsupLossMultiStage(nn.Module):
-    def __init__(self):
+    def __init__(self, edge_mode='image', lambda_edge=4.0, lambda_img=1.0):
         super(UnsupLossMultiStage, self).__init__()
-        self.unsup_loss = UnSupLoss()
+        self.unsup_loss = UnSupLoss(edge_mode=edge_mode,
+                                    lambda_edge=lambda_edge,
+                                    lambda_img=lambda_img)
 
     def forward(self, inputs, imgs, cams, **kwargs):
         depth_loss_weights = kwargs.get("dlossw", None)
+        # [B, 1, H, W] geometric-edge prior for the reference view, or None.
+        edge = kwargs.get("edge", None)
 
         total_loss = torch.tensor(0.0, dtype=torch.float32, device=imgs.device, requires_grad=False)
 
@@ -435,7 +463,7 @@ class UnsupLossMultiStage(nn.Module):
             stage_idx = int(stage_key.replace("stage", "")) - 1
 
             depth_est = stage_inputs["depth"]
-            depth_loss = self.unsup_loss(imgs, cams[stage_key], depth_est, stage_idx)
+            depth_loss = self.unsup_loss(imgs, cams[stage_key], depth_est, stage_idx, edge=edge)
 
 
             if depth_loss_weights is not None:
